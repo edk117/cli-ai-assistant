@@ -1,13 +1,23 @@
-import os
 import json
-from datetime import datetime
-from dotenv import load_dotenv
-from anthropic import Anthropic
-from openai import OpenAI
+import os
+import time
 
-# ─────────────────────────────────────────────────────────
+from anthropic import Anthropic
+from anthropic._exceptions import (
+    APIConnectionError as AnthropicConnectionError,
+    APIStatusError as AnthropicStatusError,
+    APITimeoutError as AnthropicTimeoutError,
+)
+from dotenv import load_dotenv
+from openai import OpenAI
+from openai._exceptions import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    RateLimitError,
+)
+
 # Загрузка конфигурации
-# ─────────────────────────────────────────────────────────
 load_dotenv()
 
 HISTORY_FILE = "history.json"
@@ -23,9 +33,7 @@ openai_client = OpenAI(
     base_url="https://api.proxyapi.ru/openai/v1",
 )
 
-# ─────────────────────────────────────────────────────────
 # История диалога: сохранение и загрузка
-# ─────────────────────────────────────────────────────────
 def load_history() -> list:
     """Загружает историю из JSON-файла."""
     if not os.path.exists(HISTORY_FILE):
@@ -49,25 +57,71 @@ def clear_history_file() -> None:
         os.remove(HISTORY_FILE)
 
 
-# ─────────────────────────────────────────────────────────
+# Безопасный запрос с повтором
+MAX_RETRIES = 3
+RETRY_DELAY = 5
+
+
+def safe_request(func, *args, **kwargs):
+    """Вызывает API с повтором при сетевых ошибках и таймаутах."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return func(*args, **kwargs)
+        except (APITimeoutError, AnthropicTimeoutError):
+            if attempt < MAX_RETRIES:
+                print(f"\n⏳ Сервер не отвечает. Попытка {attempt}/{MAX_RETRIES}, повтор через {RETRY_DELAY}с…")
+                time.sleep(RETRY_DELAY)
+            else:
+                print(f"\n❌ Сервер не ответил после {MAX_RETRIES} попыток.\n")
+                return None
+        except (APIConnectionError, AnthropicConnectionError):
+            if attempt < MAX_RETRIES:
+                print(f"\n⚠️  Нет соединения. Попытка {attempt}/{MAX_RETRIES}, повтор через {RETRY_DELAY}с…")
+                time.sleep(RETRY_DELAY)
+            else:
+                print(f"\n❌ Проверьте интернет-соединение.\n")
+                return None
+        except RateLimitError:
+            if attempt < MAX_RETRIES:
+                print(f"\n🚦 Превышен лимит запросов. Ждём 30с…")
+                time.sleep(30)
+            else:
+                print(f"\n❌ Слишком много запросов, попробуйте позже.\n")
+                return None
+        except (APIStatusError, AnthropicStatusError) as e:
+            if e.status_code == 401:
+                print(f"\n🔑 Неверный API-ключ. Проверьте .env.\n")
+            elif e.status_code == 404:
+                print(f"\n🔍 Модель не найдена. Проверьте название модели.\n")
+            else:
+                print(f"\n❌ Ошибка сервера ({e.status_code}): {e.message}\n")
+            return None
+        except Exception as e:
+            print(f"\n❌ Неизвестная ошибка: {e}\n")
+            return None
+
+    return None
+
+
 # Обёртка с обработкой ошибок и таймаутами
-# ─────────────────────────────────────────────────────────
+
+
 def chat_thinking(user_message: str, history: list) -> tuple[str, list]:
     """Думающая модель с отображением reasoning."""
     history.append({"role": "user", "content": user_message})
 
-    try:
-        response = anthropic_client.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=4096,
-            system=SYSTEM_PROMPT,
-            messages=history,
-            thinking={"type": "enabled", "budget_tokens": 1024},
-            timeout=60,
-        )
-    except Exception as e:
+    response = safe_request(
+        anthropic_client.messages.create,
+        model="claude-sonnet-4-5",
+        max_tokens=4096,
+        system=SYSTEM_PROMPT,
+        messages=history,
+        thinking={"type": "enabled", "budget_tokens": 1024},
+        timeout=60,
+    )
+
+    if response is None:
         history.pop()
-        print(f"\n⚠️  Ошибка запроса: {e}\n")
         return "", history
 
     # Извлекаем reasoning и ответ
@@ -99,15 +153,15 @@ def chat_normal(user_message: str, history: list) -> tuple[str, list]:
     """Обычная модель через OpenAI Chat Completions API."""
     history.append({"role": "user", "content": user_message})
 
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-5.4",
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}] + history,
-            timeout=60,
-        )
-    except Exception as e:
+    response = safe_request(
+        openai_client.chat.completions.create,
+        model="gpt-5.4",
+        messages=[{"role": "system", "content": SYSTEM_PROMPT}] + history,
+        timeout=60,
+    )
+
+    if response is None:
         history.pop()
-        print(f"\n⚠️  Ошибка запроса: {e}\n")
         return "", history
 
     assistant_message = response.choices[0].message.content
@@ -115,9 +169,9 @@ def chat_normal(user_message: str, history: list) -> tuple[str, list]:
     return assistant_message, history
 
 
-# ─────────────────────────────────────────────────────────
 # Главное меню
-# ─────────────────────────────────────────────────────────
+
+
 if __name__ == "__main__":
     print("=" * 40)
     print("  Chat Assistant — ProxyAPI")
@@ -144,7 +198,12 @@ if __name__ == "__main__":
 
     model_name = "claude-sonnet-4-5 🧠" if mode == "thinking" else "gpt-5.4"
     print(f"\n✅ Режим: {model_name}")
-    print("Команды: exit — выход, clear — очистить историю\n")
+    print("┌─────────────────────────────────────────────────┐")
+    print("│ Команды:                                        │")
+    print("│   exit / quit  — выйти и сохранить историю      │")
+    print("│   clear        — очистить историю              │")
+    print("│   Enter пустой — пропуск                       │")
+    print("└─────────────────────────────────────────────────┘\n")
 
     while True:
         user_input = input("Вы: ").strip()
